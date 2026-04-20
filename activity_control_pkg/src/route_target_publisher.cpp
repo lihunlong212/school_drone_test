@@ -22,6 +22,10 @@ namespace
 {
 constexpr double kDefaultTimerPeriodSec = 0.05;
 constexpr double kCruiseAltitudeThresholdCm = 20.0;
+constexpr std::uint8_t kSummaryStatusPending = 0;
+constexpr std::uint8_t kSummaryStatusMeasuring = 1;
+constexpr std::uint8_t kSummaryStatusDone = 2;
+constexpr std::uint8_t kSummaryStatusInvalid = 3;
 }  // namespace
 
 RouteTargetPublisherNode::RouteTargetPublisherNode(const rclcpp::NodeOptions & options)
@@ -65,6 +69,10 @@ RouteTargetPublisherNode::RouteTargetPublisherNode(const rclcpp::NodeOptions & o
     create_publisher<std_msgs::msg::Empty>("/mission_complete", rclcpp::QoS(10).reliable());
   pillar_task_result_pub_ =
     create_publisher<std_msgs::msg::Float32MultiArray>("/pillar_task_result", durable_qos);
+  pillar_task_summary_pub_ =
+    create_publisher<std_msgs::msg::Float32MultiArray>("/pillar_task_summary", durable_qos);
+  fine_data_pub_ =
+    create_publisher<std_msgs::msg::Int32MultiArray>("/fine_data", rclcpp::QoS(10));
 
   height_sub_ = create_subscription<std_msgs::msg::Int16>(
     "/height",
@@ -78,6 +86,10 @@ RouteTargetPublisherNode::RouteTargetPublisherNode(const rclcpp::NodeOptions & o
     "/pillar_position",
     durable_qos,
     std::bind(&RouteTargetPublisherNode::pillarPositionCallback, this, std::placeholders::_1));
+  circle_center_sub_ = create_subscription<geometry_msgs::msg::PointStamped>(
+    "/circle_center",
+    rclcpp::QoS(10),
+    std::bind(&RouteTargetPublisherNode::circleCenterCallback, this, std::placeholders::_1));
 
   monitor_timer_ = create_wall_timer(
     std::chrono::duration<double>(kDefaultTimerPeriodSec),
@@ -154,24 +166,58 @@ void RouteTargetPublisherNode::publishPillarTaskResult(const PillarTaskResult & 
   pillar_task_result_pub_->publish(message);
 }
 
+void RouteTargetPublisherNode::publishPillarTaskSummary()
+{
+  std_msgs::msg::Float32MultiArray message;
+  message.data.reserve(pillar_summary_slots_.size() * 6);
+
+  for (const auto & slot : pillar_summary_slots_) {
+    message.data.push_back(static_cast<float>(slot.pillar_index));
+    message.data.push_back(static_cast<float>(slot.x_m));
+    message.data.push_back(static_cast<float>(slot.y_m));
+    message.data.push_back(static_cast<float>(slot.pillar_height_cm));
+    message.data.push_back(static_cast<float>(slot.circle_rank));
+    message.data.push_back(static_cast<float>(slot.status));
+  }
+
+  pillar_task_summary_pub_->publish(message);
+}
+
 void RouteTargetPublisherNode::logMissionSummary() const
 {
-  if (pillar_results_.empty()) {
+  if (pillar_summary_slots_.empty()) {
     RCLCPP_INFO(get_logger(), "Mission summary: no pillar results recorded.");
     return;
   }
 
-  RCLCPP_INFO(get_logger(), "Mission summary: %zu pillar results recorded.", pillar_results_.size());
-  for (const auto & result : pillar_results_) {
+  RCLCPP_INFO(get_logger(), "Mission summary: %zu pillar slots recorded.", pillar_summary_slots_.size());
+  for (const auto & slot : pillar_summary_slots_) {
+    const char * status_text = "pending";
+    switch (slot.status) {
+      case kSummaryStatusMeasuring:
+        status_text = "measuring";
+        break;
+      case kSummaryStatusDone:
+        status_text = "done";
+        break;
+      case kSummaryStatusInvalid:
+        status_text = "invalid";
+        break;
+      case kSummaryStatusPending:
+      default:
+        status_text = "pending";
+        break;
+    }
+
     RCLCPP_INFO(
       get_logger(),
-      "Pillar %zu: x=%.3fm y=%.3fm height=%.1fcm circle_rank=%d valid=%s",
-      result.pillar_index,
-      result.x_m,
-      result.y_m,
-      result.pillar_height_cm,
-      result.circle_rank,
-      result.valid ? "true" : "false");
+      "Pillar %zu: x=%.3fm y=%.3fm height=%.1fcm circle_rank=%d status=%s",
+      slot.pillar_index,
+      slot.x_m,
+      slot.y_m,
+      slot.pillar_height_cm,
+      slot.circle_rank,
+      status_text);
   }
 }
 
@@ -269,6 +315,7 @@ void RouteTargetPublisherNode::pillarPositionCallback(
 
   pillar_targets_.clear();
   pillar_results_.clear();
+  pillar_summary_slots_.clear();
   current_pillar_index_ = 0;
 
   for (std::size_t index = 0; index < msg->data.size(); index += 2) {
@@ -296,6 +343,19 @@ void RouteTargetPublisherNode::pillarPositionCallback(
     return;
   }
 
+  pillar_summary_slots_.reserve(pillar_targets_.size());
+  for (std::size_t index = 0; index < pillar_targets_.size(); ++index) {
+    const auto & target = pillar_targets_[index];
+    pillar_summary_slots_.push_back(PillarTaskSummarySlot{
+      index + 1,
+      cmToMeter(target.x_cm),
+      cmToMeter(target.y_cm),
+      0.0,
+      0,
+      kSummaryStatusPending,
+    });
+  }
+
   phase_ = MissionPhase::TAKEOFF_TO_CRUISE;
   has_current_target_ = true;
   current_target_ = Target{start_x_cm_, start_y_cm_, cruise_height_cm_, mission_yaw_deg_};
@@ -312,6 +372,7 @@ void RouteTargetPublisherNode::pillarPositionCallback(
       std::hypot(cmToMeter(target.x_cm), cmToMeter(target.y_cm)));
   }
 
+  publishPillarTaskSummary();
   publishTarget(current_target_);
 }
 
@@ -328,6 +389,30 @@ void RouteTargetPublisherNode::circleRankCallback(const std_msgs::msg::Int32::Sh
   latest_circle_rank_ = msg->data;
 }
 
+void RouteTargetPublisherNode::circleCenterCallback(
+  const geometry_msgs::msg::PointStamped::SharedPtr msg)
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+
+  if (phase_ != MissionPhase::HOVER_AND_MEASURE || !fine_data_pub_) {
+    return;
+  }
+
+  std_msgs::msg::Int32MultiArray fine_data_msg;
+  fine_data_msg.data.resize(2);
+  fine_data_msg.data[0] = static_cast<std::int32_t>(std::lround(msg->point.x));
+  fine_data_msg.data[1] = static_cast<std::int32_t>(std::lround(msg->point.y));
+  fine_data_pub_->publish(fine_data_msg);
+
+  RCLCPP_DEBUG_THROTTLE(
+    get_logger(),
+    *get_clock(),
+    500,
+    "Forwarding /circle_center to /fine_data during hover: x=%d y=%d",
+    fine_data_msg.data[0],
+    fine_data_msg.data[1]);
+}
+
 void RouteTargetPublisherNode::startHoverMeasurement()
 {
   phase_ = MissionPhase::HOVER_AND_MEASURE;
@@ -335,6 +420,12 @@ void RouteTargetPublisherNode::startHoverMeasurement()
   hover_height_sum_cm_ = 0.0;
   hover_height_sample_count_ = 0;
   hover_circle_rank_counts_.clear();
+  publishVisualTakeoverState(true);
+
+  if (current_pillar_index_ < pillar_summary_slots_.size()) {
+    pillar_summary_slots_[current_pillar_index_].status = kSummaryStatusMeasuring;
+    publishPillarTaskSummary();
+  }
 
   RCLCPP_INFO(
     get_logger(),
@@ -360,6 +451,8 @@ void RouteTargetPublisherNode::sampleHoverMeasurement()
 
 void RouteTargetPublisherNode::finishCurrentPillarMeasurement()
 {
+  publishVisualTakeoverState(false);
+
   const double avg_height_cm = hover_height_sample_count_ > 0
     ? (hover_height_sum_cm_ / static_cast<double>(hover_height_sample_count_))
     : cruise_height_cm_;
@@ -388,6 +481,14 @@ void RouteTargetPublisherNode::finishCurrentPillarMeasurement()
 
   pillar_results_.push_back(result);
   publishPillarTaskResult(result);
+
+  if (current_pillar_index_ < pillar_summary_slots_.size()) {
+    auto & slot = pillar_summary_slots_[current_pillar_index_];
+    slot.pillar_height_cm = result.pillar_height_cm;
+    slot.circle_rank = result.circle_rank;
+    slot.status = result.valid ? kSummaryStatusDone : kSummaryStatusInvalid;
+    publishPillarTaskSummary();
+  }
 
   RCLCPP_INFO(
     get_logger(),
@@ -430,6 +531,7 @@ void RouteTargetPublisherNode::completeMission(const std::string & reason)
     mission_complete_sent_ = true;
   }
 
+  publishPillarTaskSummary();
   RCLCPP_INFO(get_logger(), "%s", reason.c_str());
   logMissionSummary();
 }

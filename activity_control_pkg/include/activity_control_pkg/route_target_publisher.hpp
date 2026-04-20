@@ -8,12 +8,14 @@
 #include <string>
 #include <vector>
 
+#include <geometry_msgs/msg/point_stamped.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/empty.hpp>
 #include <std_msgs/msg/float32_multi_array.hpp>
 #include <std_msgs/msg/int16.hpp>
 #include <std_msgs/msg/int32.hpp>
+#include <std_msgs/msg/int32_multi_array.hpp>
 #include <std_msgs/msg/u_int8.hpp>
 #include <tf2_ros/buffer.h>
 #include <tf2_ros/transform_listener.h>
@@ -39,6 +41,16 @@ struct PillarTaskResult
   bool valid;
 };
 
+struct PillarTaskSummarySlot
+{
+  std::size_t pillar_index;
+  double x_m;
+  double y_m;
+  double pillar_height_cm;
+  int circle_rank;
+  std::uint8_t status;
+};
+
 enum class MissionPhase : std::uint8_t
 {
   WAIT_PILLARS = 0,
@@ -60,6 +72,7 @@ private:
   void publishActiveController(std::uint8_t controller_id);
   void publishVisualTakeoverState(bool active);
   void publishPillarTaskResult(const PillarTaskResult & result);
+  void publishPillarTaskSummary();
   void logMissionSummary() const;
 
   bool getCurrentPose(double & x_cm, double & y_cm, double & z_cm, double & yaw_deg);
@@ -69,6 +82,7 @@ private:
   void pillarPositionCallback(const std_msgs::msg::Float32MultiArray::SharedPtr msg);
   void heightCallback(const std_msgs::msg::Int16::SharedPtr msg);
   void circleRankCallback(const std_msgs::msg::Int32::SharedPtr msg);
+  void circleCenterCallback(const geometry_msgs::msg::PointStamped::SharedPtr msg);
   void monitorTimerCallback();
 
   void startHoverMeasurement();
@@ -85,10 +99,13 @@ private:
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr visual_takeover_active_pub_;
   rclcpp::Publisher<std_msgs::msg::Empty>::SharedPtr mission_complete_pub_;
   rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr pillar_task_result_pub_;
+  rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr pillar_task_summary_pub_;
+  rclcpp::Publisher<std_msgs::msg::Int32MultiArray>::SharedPtr fine_data_pub_;
 
   rclcpp::Subscription<std_msgs::msg::Int16>::SharedPtr height_sub_;
   rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr circle_rank_sub_;
   rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr pillar_position_sub_;
+  rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr circle_center_sub_;
   rclcpp::TimerBase::SharedPtr monitor_timer_;
 
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
@@ -126,6 +143,7 @@ private:
 
   std::vector<Target> pillar_targets_;
   std::vector<PillarTaskResult> pillar_results_;
+  std::vector<PillarTaskSummarySlot> pillar_summary_slots_;
 
   rclcpp::Time hover_start_time_;
   double hover_height_sum_cm_;
