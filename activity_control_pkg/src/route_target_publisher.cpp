@@ -7,6 +7,7 @@
 #include <cmath>
 #include <functional>
 #include <limits>
+#include <map>
 #include <string>
 
 #include <geometry_msgs/msg/transform_stamped.hpp>
@@ -21,6 +22,7 @@ namespace activity_control_pkg
 namespace
 {
 constexpr double kDefaultTimerPeriodSec = 0.05;
+constexpr double kCircleRankWindowSec = 5.0;
 constexpr double kCruiseAltitudeThresholdCm = 20.0;
 constexpr std::uint8_t kSummaryStatusPending = 0;
 constexpr std::uint8_t kSummaryStatusMeasuring = 1;
@@ -43,6 +45,8 @@ RouteTargetPublisherNode::RouteTargetPublisherNode(const rclcpp::NodeOptions & o
   hover_time_sec_(declare_parameter("hover_time_sec", 5.0)),
   pillar_height_threshold_cm_(declare_parameter("pillar_height_threshold_cm", 40.0)),
   landing_align_time_sec_(declare_parameter("landing_align_time_sec", 3.0)),
+  visual_alignment_tolerance_px_(declare_parameter("visual_alignment_tolerance_px", 20.0)),
+  visual_alignment_timeout_sec_(declare_parameter("visual_alignment_timeout_sec", 0.5)),
   has_height_(false),
   current_height_cm_(0.0),
   latest_circle_rank_(0),
@@ -57,7 +61,10 @@ RouteTargetPublisherNode::RouteTargetPublisherNode(const rclcpp::NodeOptions & o
   pillar_min_range_valid_(false),
   pillar_min_range_min_m_(0.0),
   pillar_ground_height_sample_count_(0),
-  pillar_min_range_sample_count_(0)
+  pillar_min_range_sample_count_(0),
+  hover_visual_error_x_px_(0.0),
+  hover_visual_error_y_px_(0.0),
+  hover_has_visual_alignment_(false)
 {
   map_frame_ = declare_parameter("map_frame", "map");
   laser_link_frame_ = declare_parameter("laser_link_frame", "laser_link");
@@ -331,6 +338,22 @@ double RouteTargetPublisherNode::normalizeAngleDeg(double angle_deg) const
   return angles::to_degrees(normalized);
 }
 
+bool RouteTargetPublisherNode::hasFreshHoverVisualData(const rclcpp::Time & reference_time) const
+{
+  if (!hover_has_visual_alignment_ || hover_last_visual_sample_time_.nanoseconds() == 0) {
+    return false;
+  }
+
+  return (reference_time - hover_last_visual_sample_time_).seconds() <= visual_alignment_timeout_sec_;
+}
+
+bool RouteTargetPublisherNode::isHoverVisuallyAligned() const
+{
+  return
+    std::fabs(hover_visual_error_x_px_) <= visual_alignment_tolerance_px_ &&
+    std::fabs(hover_visual_error_y_px_) <= visual_alignment_tolerance_px_;
+}
+
 void RouteTargetPublisherNode::pillarPositionCallback(
   const std_msgs::msg::Float32MultiArray::SharedPtr msg)
 {
@@ -470,6 +493,16 @@ void RouteTargetPublisherNode::circleRankCallback(const std_msgs::msg::Int32::Sh
 {
   std::lock_guard<std::mutex> lock(mutex_);
   latest_circle_rank_ = msg->data;
+
+  if (phase_ != MissionPhase::HOVER_AND_MEASURE || current_pillar_index_ >= pillar_targets_.size()) {
+    return;
+  }
+
+  const rclcpp::Time sample_time = now();
+  pruneHoverCircleRankSamples(sample_time);
+  if (msg->data > 0 && hasFreshHoverVisualData(sample_time) && isHoverVisuallyAligned()) {
+    hover_circle_rank_samples_.push_back(TimedCircleRankSample{sample_time, msg->data});
+  }
 }
 
 void RouteTargetPublisherNode::circleCenterCallback(
@@ -486,11 +519,22 @@ void RouteTargetPublisherNode::circleCenterCallback(
     return;
   }
 
+  if (!std::isfinite(msg->point.x) || !std::isfinite(msg->point.y)) {
+    return;
+  }
+
   std_msgs::msg::Int32MultiArray fine_data_msg;
   fine_data_msg.data.resize(2);
   fine_data_msg.data[0] = static_cast<std::int32_t>(std::lround(msg->point.x));
   fine_data_msg.data[1] = static_cast<std::int32_t>(std::lround(msg->point.y));
   fine_data_pub_->publish(fine_data_msg);
+
+  if (phase_ == MissionPhase::HOVER_AND_MEASURE) {
+    hover_visual_error_x_px_ = msg->point.x;
+    hover_visual_error_y_px_ = msg->point.y;
+    hover_last_visual_sample_time_ = now();
+    hover_has_visual_alignment_ = true;
+  }
 
   RCLCPP_DEBUG_THROTTLE(
     get_logger(),
@@ -517,7 +561,11 @@ void RouteTargetPublisherNode::startHoverMeasurement()
   phase_ = MissionPhase::HOVER_AND_MEASURE;
   hover_start_time_ = now();
   resetCurrentPillarSamples();
-  hover_circle_rank_counts_.clear();
+  hover_circle_rank_samples_.clear();
+  hover_last_visual_sample_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
+  hover_visual_error_x_px_ = 0.0;
+  hover_visual_error_y_px_ = 0.0;
+  hover_has_visual_alignment_ = false;
   publishVisualTakeoverState(true);
   publishOnPillar(true);
   publishHeightFilterEnabled(true);
@@ -539,8 +587,17 @@ void RouteTargetPublisherNode::startHoverMeasurement()
 
 void RouteTargetPublisherNode::sampleHoverMeasurement()
 {
-  if (latest_circle_rank_ > 0) {
-    ++hover_circle_rank_counts_[latest_circle_rank_];
+  pruneHoverCircleRankSamples(now());
+}
+
+void RouteTargetPublisherNode::pruneHoverCircleRankSamples(const rclcpp::Time & reference_time)
+{
+  while (!hover_circle_rank_samples_.empty()) {
+    const double age_sec = (reference_time - hover_circle_rank_samples_.front().stamp).seconds();
+    if (age_sec <= kCircleRankWindowSec) {
+      break;
+    }
+    hover_circle_rank_samples_.pop_front();
   }
 }
 
@@ -548,15 +605,21 @@ void RouteTargetPublisherNode::finishCurrentPillarMeasurement()
 {
   publishOnPillar(false);
   publishVisualTakeoverState(false);
+  pruneHoverCircleRankSamples(now());
 
   const bool valid = pillar_ground_height_valid_ && pillar_min_range_valid_;
   const double pillar_height_cm = valid
     ? std::max(0.0, pillar_ground_height_max_m_ - pillar_min_range_min_m_) * 100.0
     : 0.0;
 
+  std::map<int, int> hover_circle_rank_counts;
+  for (const auto & sample : hover_circle_rank_samples_) {
+    ++hover_circle_rank_counts[sample.rank];
+  }
+
   int mode_circle_rank = 0;
   int mode_count = 0;
-  for (const auto & entry : hover_circle_rank_counts_) {
+  for (const auto & entry : hover_circle_rank_counts) {
     if (entry.second > mode_count || (entry.second == mode_count && entry.first < mode_circle_rank)) {
       mode_circle_rank = entry.first;
       mode_count = entry.second;
@@ -586,14 +649,18 @@ void RouteTargetPublisherNode::finishCurrentPillarMeasurement()
 
   RCLCPP_INFO(
     get_logger(),
-    "Finished pillar %zu/%zu: pillar_height=%.1fcm circle_rank=%d valid=%s ground_samples=%zu min_samples=%zu",
+    "Finished pillar %zu/%zu: pillar_height=%.1fcm circle_rank=%d valid=%s ground_samples=%zu min_samples=%zu aligned_rank_samples_in_5s=%zu visual_aligned_now=%s visual_err=(%.1f, %.1f)px",
     result.pillar_index,
     pillar_targets_.size(),
     pillar_height_cm,
     result.circle_rank,
     result.valid ? "true" : "false",
     pillar_ground_height_sample_count_,
-    pillar_min_range_sample_count_);
+    pillar_min_range_sample_count_,
+    hover_circle_rank_samples_.size(),
+    (hasFreshHoverVisualData(now()) && isHoverVisuallyAligned()) ? "true" : "false",
+    hover_visual_error_x_px_,
+    hover_visual_error_y_px_);
 
   ++current_pillar_index_;
   if (current_pillar_index_ < pillar_targets_.size()) {
@@ -665,14 +732,18 @@ void RouteTargetPublisherNode::monitorTimerCallback()
       get_logger(),
       *get_clock(),
       1000,
-      "Hovering on pillar %zu/%zu: elapsed=%.1fs/%.1fs latest_circle_rank=%d ground_samples=%zu min_samples=%zu",
+      "Hovering on pillar %zu/%zu: elapsed=%.1fs/%.1fs latest_circle_rank=%d ground_samples=%zu min_samples=%zu visual_aligned=%s visual_err=(%.1f, %.1f)px aligned_rank_samples=%zu",
       current_pillar_index_ + 1,
       pillar_targets_.size(),
       elapsed_sec,
       hover_time_sec_,
       latest_circle_rank_,
       pillar_ground_height_sample_count_,
-      pillar_min_range_sample_count_);
+      pillar_min_range_sample_count_,
+      (hasFreshHoverVisualData(now()) && isHoverVisuallyAligned()) ? "true" : "false",
+      hover_visual_error_x_px_,
+      hover_visual_error_y_px_,
+      hover_circle_rank_samples_.size());
 
     if (elapsed_sec >= hover_time_sec_) {
       finishCurrentPillarMeasurement();

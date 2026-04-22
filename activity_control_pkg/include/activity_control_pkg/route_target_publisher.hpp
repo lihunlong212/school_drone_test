@@ -2,7 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
-#include <map>
+#include <deque>
 #include <memory>
 #include <mutex>
 #include <string>
@@ -80,6 +80,8 @@ private:
   bool getCurrentPose(double & x_cm, double & y_cm, double & z_cm, double & yaw_deg);
   bool isReached(const Target & target, double x_cm, double y_cm, double z_cm, double yaw_deg) const;
   double normalizeAngleDeg(double angle_deg) const;
+  bool hasFreshHoverVisualData(const rclcpp::Time & reference_time) const;
+  bool isHoverVisuallyAligned() const;
 
   void pillarPositionCallback(const std_msgs::msg::Float32MultiArray::SharedPtr msg);
   void groundHeightCallback(const std_msgs::msg::Float32::SharedPtr msg);
@@ -91,6 +93,7 @@ private:
   void startHoverMeasurement();
   void resetCurrentPillarSamples();
   void sampleHoverMeasurement();
+  void pruneHoverCircleRankSamples(const rclcpp::Time & reference_time);
   void finishCurrentPillarMeasurement();
   void completeMission(const std::string & reason);
 
@@ -138,6 +141,8 @@ private:
   double hover_time_sec_;
   double pillar_height_threshold_cm_;
   double landing_align_time_sec_;
+  double visual_alignment_tolerance_px_;
+  double visual_alignment_timeout_sec_;
 
   bool has_height_;
   double current_height_cm_;
@@ -155,13 +160,22 @@ private:
   std::vector<PillarTaskSummarySlot> pillar_summary_slots_;
 
   rclcpp::Time hover_start_time_;
+  rclcpp::Time hover_last_visual_sample_time_;
+  struct TimedCircleRankSample
+  {
+    rclcpp::Time stamp;
+    int rank;
+  };
   bool pillar_ground_height_valid_;
   double pillar_ground_height_max_m_;
   bool pillar_min_range_valid_;
   double pillar_min_range_min_m_;
   std::size_t pillar_ground_height_sample_count_;
   std::size_t pillar_min_range_sample_count_;
-  std::map<int, int> hover_circle_rank_counts_;
+  std::deque<TimedCircleRankSample> hover_circle_rank_samples_;
+  double hover_visual_error_x_px_;
+  double hover_visual_error_y_px_;
+  bool hover_has_visual_alignment_;
 
   rclcpp::Time land_align_start_time_;
 
