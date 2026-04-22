@@ -22,11 +22,8 @@ UartToStm32::UartToStm32(rclcpp::Node::SharedPtr node)
   velocity_valid_(false),
   route_task_active_(false),
   has_st_ready_pub_(false),
-  last_height_valid_(false),
-  last_published_height_cm_(0),
-  jump_suppress_count_(0),
-  pillar_jump_threshold_cm_(35),
-  pillar_jump_recover_count_(10)
+  cruise_height_cm_(130),
+  height_band_cm_(20)
 {
   RCLCPP_INFO(node_->get_logger(), "UartToStm32 created");
 }
@@ -86,20 +83,24 @@ bool UartToStm32::initialize(double update_rate, const std::string & source_fram
       "/mission_complete", rclcpp::QoS(10),
       std::bind(&UartToStm32::missionCompleteCallback, this, std::placeholders::_1));
 
-    pillar_jump_threshold_cm_ = static_cast<int>(
-      node_->declare_parameter<int>("pillar_jump_threshold_cm", 35));
-    pillar_jump_recover_count_ = static_cast<int>(
-      node_->declare_parameter<int>("pillar_jump_recover_count", 10));
+    cruise_height_cm_ = static_cast<int>(
+      node_->declare_parameter<int>("cruise_height_cm", 130));
+    height_band_cm_ = static_cast<int>(
+      node_->declare_parameter<int>("height_band_cm", 20));
 
-    const auto on_pillar_qos = rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable();
+    const auto latched_qos = rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable();
     on_pillar_sub_ = node_->create_subscription<std_msgs::msg::Bool>(
-      "/on_pillar", on_pillar_qos,
+      "/on_pillar", latched_qos,
       std::bind(&UartToStm32::onPillarCallback, this, std::placeholders::_1));
+    height_filter_enabled_sub_ = node_->create_subscription<std_msgs::msg::Bool>(
+      "/height_filter_enabled", latched_qos,
+      std::bind(&UartToStm32::heightFilterEnabledCallback, this, std::placeholders::_1));
 
     pillar_signal_timer_ = node_->create_wall_timer(
       1s, std::bind(&UartToStm32::pillarSignalTimerCallback, this));
 
     height_pub_ = node_->create_publisher<std_msgs::msg::Int16>("/height", 10);
+    height_raw_pub_ = node_->create_publisher<std_msgs::msg::Int16>("/height_raw", 10);
     is_st_ready_pub_ =
       node_->create_publisher<std_msgs::msg::UInt8>("/is_st_ready", rclcpp::QoS(10).transient_local());
     mission_step_pub_ = node_->create_publisher<std_msgs::msg::UInt8>("/mission_step", 10);
@@ -483,35 +484,40 @@ void UartToStm32::pillarSignalTimerCallback()
     "Sent pillar signal: 0x22/0x%02X", static_cast<unsigned>(payload));
 }
 
+void UartToStm32::heightFilterEnabledCallback(const std_msgs::msg::Bool::SharedPtr msg)
+{
+  const bool new_state = msg->data;
+  const bool prev = height_filter_enabled_.exchange(new_state);
+  if (prev != new_state) {
+    RCLCPP_INFO(
+      node_->get_logger(),
+      "/height_filter_enabled changed: %s -> %s",
+      prev ? "true" : "false", new_state ? "true" : "false");
+  }
+}
+
 void UartToStm32::publishFilteredHeight(int16_t raw_value_cm)
 {
-  if (!height_pub_) {
+  if (!height_pub_ || !height_raw_pub_) {
     RCLCPP_WARN(node_->get_logger(), "Height publisher not initialized");
     return;
   }
 
-  int16_t out_value = raw_value_cm;
+  std_msgs::msg::Int16 raw_msg;
+  raw_msg.data = raw_value_cm;
+  height_raw_pub_->publish(raw_msg);
 
-  if (last_height_valid_) {
-    const int diff = std::abs(static_cast<int>(raw_value_cm) - static_cast<int>(last_published_height_cm_));
-    if (diff > pillar_jump_threshold_cm_) {
-      ++jump_suppress_count_;
-      if (jump_suppress_count_ < pillar_jump_recover_count_) {
-        out_value = last_published_height_cm_;
-        RCLCPP_DEBUG_THROTTLE(
-          node_->get_logger(), *node_->get_clock(), 500,
-          "Suppressing height jump: raw=%d last=%d diff=%d (count=%d/%d)",
-          raw_value_cm, last_published_height_cm_, diff,
-          jump_suppress_count_, pillar_jump_recover_count_);
-      } else {
-        RCLCPP_INFO(
-          node_->get_logger(),
-          "Height jump persisted for %d samples, accepting new value: %d -> %d",
-          pillar_jump_recover_count_, last_published_height_cm_, raw_value_cm);
-        jump_suppress_count_ = 0;
-      }
-    } else {
-      jump_suppress_count_ = 0;
+  int16_t out_value = raw_value_cm;
+  const bool filter_on = height_filter_enabled_.load();
+
+  if (filter_on) {
+    const int deviation = std::abs(static_cast<int>(raw_value_cm) - cruise_height_cm_);
+    if (deviation > height_band_cm_) {
+      out_value = static_cast<int16_t>(cruise_height_cm_);
+      RCLCPP_DEBUG_THROTTLE(
+        node_->get_logger(), *node_->get_clock(), 500,
+        "Height out-of-band (raw=%d cruise=%d band=%d) -> hold cruise",
+        raw_value_cm, cruise_height_cm_, height_band_cm_);
     }
   }
 
@@ -519,12 +525,10 @@ void UartToStm32::publishFilteredHeight(int16_t raw_value_cm)
   msg.data = out_value;
   height_pub_->publish(msg);
 
-  last_published_height_cm_ = out_value;
-  last_height_valid_ = true;
-
   RCLCPP_INFO_THROTTLE(
     node_->get_logger(), *node_->get_clock(), 1000,
-    "Published /height: %d (raw=%d)", out_value, raw_value_cm);
+    "Published /height: %d (raw=%d filter=%s)",
+    out_value, raw_value_cm, filter_on ? "on" : "off");
 }
 
 }  // namespace uart_to_stm32

@@ -40,6 +40,7 @@ private:
   void targetVelocityCallback(const std_msgs::msg::Float32MultiArray::SharedPtr msg);
   void missionCompleteCallback(const std_msgs::msg::Empty::SharedPtr msg);
   void onPillarCallback(const std_msgs::msg::Bool::SharedPtr msg);
+  void heightFilterEnabledCallback(const std_msgs::msg::Bool::SharedPtr msg);
   void pillarSignalTimerCallback();
   void protocolDataHandler(uint8_t id, const std::vector<uint8_t> & data);
   void publishFilteredHeight(int16_t raw_value_cm);
@@ -62,11 +63,13 @@ private:
   rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr target_velocity_sub_;
   rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr mission_complete_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr on_pillar_sub_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr height_filter_enabled_sub_;
   rclcpp::TimerBase::SharedPtr pillar_signal_timer_;
 
   std::unique_ptr<serial_comm::SerialComm> serial_comm_;
 
   rclcpp::Publisher<std_msgs::msg::Int16>::SharedPtr height_pub_;
+  rclcpp::Publisher<std_msgs::msg::Int16>::SharedPtr height_raw_pub_;
   rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr is_st_ready_pub_;
   rclcpp::Publisher<std_msgs::msg::UInt8>::SharedPtr mission_step_pub_;
 
@@ -78,12 +81,10 @@ private:
   bool has_st_ready_pub_;
 
   std::atomic<bool> on_pillar_{false};
+  std::atomic<bool> height_filter_enabled_{false};
 
-  bool last_height_valid_;
-  int16_t last_published_height_cm_;
-  int jump_suppress_count_;
-  int pillar_jump_threshold_cm_;
-  int pillar_jump_recover_count_;
+  int cruise_height_cm_;
+  int height_band_cm_;
 
   static constexpr uint8_t VELOCITY_FRAME_ID = 0x32;
   static constexpr uint8_t TARGET_VELOCITY_FRAME_ID = 0x31;

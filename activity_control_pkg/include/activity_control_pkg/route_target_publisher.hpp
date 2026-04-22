@@ -82,6 +82,7 @@ private:
 
   void pillarPositionCallback(const std_msgs::msg::Float32MultiArray::SharedPtr msg);
   void heightCallback(const std_msgs::msg::Int16::SharedPtr msg);
+  void heightRawCallback(const std_msgs::msg::Int16::SharedPtr msg);
   void circleRankCallback(const std_msgs::msg::Int32::SharedPtr msg);
   void circleCenterCallback(const geometry_msgs::msg::PointStamped::SharedPtr msg);
   void monitorTimerCallback();
@@ -103,8 +104,10 @@ private:
   rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr pillar_task_summary_pub_;
   rclcpp::Publisher<std_msgs::msg::Int32MultiArray>::SharedPtr fine_data_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr on_pillar_pub_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr height_filter_enabled_pub_;
 
   rclcpp::Subscription<std_msgs::msg::Int16>::SharedPtr height_sub_;
+  rclcpp::Subscription<std_msgs::msg::Int16>::SharedPtr height_raw_sub_;
   rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr circle_rank_sub_;
   rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr pillar_position_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr circle_center_sub_;
