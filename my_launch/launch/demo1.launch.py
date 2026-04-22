@@ -11,6 +11,7 @@ def generate_launch_description():
     uart_to_stm32_pkg_share = FindPackageShare(package="uart_to_stm32").find("uart_to_stm32")
     pid_control_pkg_share = FindPackageShare(package="pid_control_pkg").find("pid_control_pkg")
     activity_control_pkg_share = FindPackageShare(package="activity_control_pkg").find("activity_control_pkg")
+    laser_array_pkg_share = FindPackageShare(package="laser_array_pkg").find("laser_array_pkg")
     pillar_detector_pkg_share = FindPackageShare(package="pillar_detector_pkg").find("pillar_detector_pkg")
     circle_detector_pkg_share = FindPackageShare(package="circle_detector_pkg").find("circle_detector_pkg")
 
@@ -34,6 +35,11 @@ def generate_launch_description():
             os.path.join(activity_control_pkg_share, "launch", "route_target_publisher.launch.py")
         )
     )
+    laser_array_ground_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            os.path.join(laser_array_pkg_share, "launch", "laser_array_ground.launch.py")
+        )
+    )
     pillar_detector_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
             os.path.join(pillar_detector_pkg_share, "launch", "pillar_detector.launch.py")
@@ -50,6 +56,7 @@ def generate_launch_description():
         uart_to_stm32_launch,
         position_pid_controller_launch,
         route_target_publisher_launch,
+        laser_array_ground_launch,
         pillar_detector_launch,
         circle_detector_launch,
     ])

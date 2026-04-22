@@ -36,6 +36,7 @@ RouteTargetPublisherNode::RouteTargetPublisherNode(const rclcpp::NodeOptions & o
   start_x_cm_(declare_parameter("start_x_cm", 0.0)),
   start_y_cm_(declare_parameter("start_y_cm", 0.0)),
   cruise_height_cm_(declare_parameter("cruise_height_cm", 130.0)),
+  height_band_cm_(declare_parameter("height_band_cm", 20.0)),
   landing_x_cm_(declare_parameter("landing_x_cm", 250.0)),
   landing_y_cm_(declare_parameter("landing_y_cm", -250.0)),
   mission_yaw_deg_(declare_parameter("mission_yaw_deg", 0.0)),
@@ -51,8 +52,12 @@ RouteTargetPublisherNode::RouteTargetPublisherNode(const rclcpp::NodeOptions & o
   has_current_target_(false),
   current_target_{0.0, 0.0, 0.0, 0.0},
   current_pillar_index_(0),
-  hover_height_sum_cm_(0.0),
-  hover_height_sample_count_(0)
+  pillar_ground_height_valid_(false),
+  pillar_ground_height_max_m_(0.0),
+  pillar_min_range_valid_(false),
+  pillar_min_range_min_m_(0.0),
+  pillar_ground_height_sample_count_(0),
+  pillar_min_range_sample_count_(0)
 {
   map_frame_ = declare_parameter("map_frame", "map");
   laser_link_frame_ = declare_parameter("laser_link_frame", "laser_link");
@@ -76,11 +81,17 @@ RouteTargetPublisherNode::RouteTargetPublisherNode(const rclcpp::NodeOptions & o
     create_publisher<std_msgs::msg::Int32MultiArray>("/fine_data", rclcpp::QoS(10));
   on_pillar_pub_ =
     create_publisher<std_msgs::msg::Bool>("/on_pillar", durable_qos);
+  height_filter_enabled_pub_ =
+    create_publisher<std_msgs::msg::Bool>("/height_filter_enabled", durable_qos);
 
-  height_sub_ = create_subscription<std_msgs::msg::Int16>(
-    "/height",
+  ground_height_sub_ = create_subscription<std_msgs::msg::Float32>(
+    "/laser_array/ground_height",
     rclcpp::QoS(10),
-    std::bind(&RouteTargetPublisherNode::heightCallback, this, std::placeholders::_1));
+    std::bind(&RouteTargetPublisherNode::groundHeightCallback, this, std::placeholders::_1));
+  min_range_sub_ = create_subscription<std_msgs::msg::Float32>(
+    "/laser_array/min_range",
+    rclcpp::QoS(10),
+    std::bind(&RouteTargetPublisherNode::minRangeCallback, this, std::placeholders::_1));
   circle_rank_sub_ = create_subscription<std_msgs::msg::Int32>(
     "/circle_rank",
     rclcpp::QoS(10),
@@ -100,6 +111,7 @@ RouteTargetPublisherNode::RouteTargetPublisherNode(const rclcpp::NodeOptions & o
 
   publishVisualTakeoverState(false);
   publishOnPillar(false);
+  publishHeightFilterEnabled(false);
   publishActiveController(3);
 
   RCLCPP_INFO(
@@ -110,15 +122,15 @@ RouteTargetPublisherNode::RouteTargetPublisherNode(const rclcpp::NodeOptions & o
     output_topic_.c_str());
   RCLCPP_INFO(
     get_logger(),
-    "Mission params: start=(%.1f, %.1f)cm cruise=%.1fcm landing=(%.1f, %.1f)cm yaw=%.1fdeg hover=%.1fs threshold=%.1fcm",
+    "Mission params: start=(%.1f, %.1f)cm cruise=%.1fcm band=%.1fcm landing=(%.1f, %.1f)cm yaw=%.1fdeg hover=%.1fs",
     start_x_cm_,
     start_y_cm_,
     cruise_height_cm_,
+    height_band_cm_,
     landing_x_cm_,
     landing_y_cm_,
     mission_yaw_deg_,
-    hover_time_sec_,
-    pillar_height_threshold_cm_);
+    hover_time_sec_);
 }
 
 void RouteTargetPublisherNode::publishTarget(const Target & target)
@@ -155,6 +167,17 @@ void RouteTargetPublisherNode::publishVisualTakeoverState(bool active)
   std_msgs::msg::Bool message;
   message.data = active;
   visual_takeover_active_pub_->publish(message);
+}
+
+void RouteTargetPublisherNode::publishHeightFilterEnabled(bool enabled)
+{
+  if (!height_filter_enabled_pub_) {
+    return;
+  }
+
+  std_msgs::msg::Bool message;
+  message.data = enabled;
+  height_filter_enabled_pub_->publish(message);
 }
 
 void RouteTargetPublisherNode::publishOnPillar(bool active)
@@ -246,7 +269,7 @@ bool RouteTargetPublisherNode::getCurrentPose(
       get_logger(),
       *get_clock(),
       2000,
-      "Waiting for /height before evaluating mission progress.");
+      "Waiting for /laser_array/ground_height before evaluating mission progress.");
     return false;
   }
 
@@ -373,6 +396,8 @@ void RouteTargetPublisherNode::pillarPositionCallback(
   phase_ = MissionPhase::TAKEOFF_TO_CRUISE;
   has_current_target_ = true;
   current_target_ = Target{start_x_cm_, start_y_cm_, cruise_height_cm_, mission_yaw_deg_};
+  resetCurrentPillarSamples();
+  publishHeightFilterEnabled(false);
 
   RCLCPP_INFO(get_logger(), "Received %zu pillar targets. Mission will start automatically.", pillar_targets_.size());
   for (std::size_t index = 0; index < pillar_targets_.size(); ++index) {
@@ -390,11 +415,55 @@ void RouteTargetPublisherNode::pillarPositionCallback(
   publishTarget(current_target_);
 }
 
-void RouteTargetPublisherNode::heightCallback(const std_msgs::msg::Int16::SharedPtr msg)
+void RouteTargetPublisherNode::groundHeightCallback(const std_msgs::msg::Float32::SharedPtr msg)
 {
+  if (!std::isfinite(msg->data)) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(),
+      *get_clock(),
+      2000,
+      "Ignoring non-finite /laser_array/ground_height sample.");
+    return;
+  }
+
   std::lock_guard<std::mutex> lock(mutex_);
-  current_height_cm_ = static_cast<double>(msg->data);
+  const double ground_height_m = static_cast<double>(msg->data);
+  current_height_cm_ = meterToCm(ground_height_m);
   has_height_ = true;
+
+  if (phase_ != MissionPhase::HOVER_AND_MEASURE || current_pillar_index_ >= pillar_targets_.size()) {
+    return;
+  }
+
+  if (!pillar_ground_height_valid_ || ground_height_m > pillar_ground_height_max_m_) {
+    pillar_ground_height_max_m_ = ground_height_m;
+  }
+  pillar_ground_height_valid_ = true;
+  ++pillar_ground_height_sample_count_;
+}
+
+void RouteTargetPublisherNode::minRangeCallback(const std_msgs::msg::Float32::SharedPtr msg)
+{
+  if (!std::isfinite(msg->data)) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(),
+      *get_clock(),
+      2000,
+      "Ignoring non-finite /laser_array/min_range sample.");
+    return;
+  }
+
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (phase_ != MissionPhase::HOVER_AND_MEASURE || current_pillar_index_ >= pillar_targets_.size()) {
+    return;
+  }
+
+  const double min_range_m = static_cast<double>(msg->data);
+  if (!pillar_min_range_valid_ || min_range_m < pillar_min_range_min_m_) {
+    pillar_min_range_min_m_ = min_range_m;
+  }
+  pillar_min_range_valid_ = true;
+  ++pillar_min_range_sample_count_;
 }
 
 void RouteTargetPublisherNode::circleRankCallback(const std_msgs::msg::Int32::SharedPtr msg)
@@ -433,15 +502,25 @@ void RouteTargetPublisherNode::circleCenterCallback(
     fine_data_msg.data[1]);
 }
 
+void RouteTargetPublisherNode::resetCurrentPillarSamples()
+{
+  pillar_ground_height_valid_ = false;
+  pillar_ground_height_max_m_ = 0.0;
+  pillar_min_range_valid_ = false;
+  pillar_min_range_min_m_ = 0.0;
+  pillar_ground_height_sample_count_ = 0;
+  pillar_min_range_sample_count_ = 0;
+}
+
 void RouteTargetPublisherNode::startHoverMeasurement()
 {
   phase_ = MissionPhase::HOVER_AND_MEASURE;
   hover_start_time_ = now();
-  hover_height_sum_cm_ = 0.0;
-  hover_height_sample_count_ = 0;
+  resetCurrentPillarSamples();
   hover_circle_rank_counts_.clear();
   publishVisualTakeoverState(true);
   publishOnPillar(true);
+  publishHeightFilterEnabled(true);
 
   if (current_pillar_index_ < pillar_summary_slots_.size()) {
     pillar_summary_slots_[current_pillar_index_].status = kSummaryStatusMeasuring;
@@ -460,11 +539,6 @@ void RouteTargetPublisherNode::startHoverMeasurement()
 
 void RouteTargetPublisherNode::sampleHoverMeasurement()
 {
-  if (has_height_) {
-    hover_height_sum_cm_ += current_height_cm_;
-    ++hover_height_sample_count_;
-  }
-
   if (latest_circle_rank_ > 0) {
     ++hover_circle_rank_counts_[latest_circle_rank_];
   }
@@ -475,12 +549,10 @@ void RouteTargetPublisherNode::finishCurrentPillarMeasurement()
   publishOnPillar(false);
   publishVisualTakeoverState(false);
 
-  const double avg_height_cm = hover_height_sample_count_ > 0
-    ? (hover_height_sum_cm_ / static_cast<double>(hover_height_sample_count_))
-    : cruise_height_cm_;
-  const double raw_pillar_height_cm = cruise_height_cm_ - avg_height_cm;
-  const bool valid =
-    hover_height_sample_count_ > 0 && raw_pillar_height_cm > pillar_height_threshold_cm_;
+  const bool valid = pillar_ground_height_valid_ && pillar_min_range_valid_;
+  const double pillar_height_cm = valid
+    ? std::max(0.0, pillar_ground_height_max_m_ - pillar_min_range_min_m_) * 100.0
+    : 0.0;
 
   int mode_circle_rank = 0;
   int mode_count = 0;
@@ -496,7 +568,7 @@ void RouteTargetPublisherNode::finishCurrentPillarMeasurement()
     current_pillar_index_ + 1,
     cmToMeter(pillar_target.x_cm),
     cmToMeter(pillar_target.y_cm),
-    valid ? raw_pillar_height_cm : 0.0,
+    pillar_height_cm,
     mode_circle_rank,
     valid,
   };
@@ -514,24 +586,27 @@ void RouteTargetPublisherNode::finishCurrentPillarMeasurement()
 
   RCLCPP_INFO(
     get_logger(),
-    "Finished pillar %zu/%zu: avg_height=%.1fcm pillar_height=%.1fcm circle_rank=%d valid=%s samples=%zu",
+    "Finished pillar %zu/%zu: pillar_height=%.1fcm circle_rank=%d valid=%s ground_samples=%zu min_samples=%zu",
     result.pillar_index,
     pillar_targets_.size(),
-    avg_height_cm,
-    result.pillar_height_cm,
+    pillar_height_cm,
     result.circle_rank,
     result.valid ? "true" : "false",
-    hover_height_sample_count_);
+    pillar_ground_height_sample_count_,
+    pillar_min_range_sample_count_);
 
   ++current_pillar_index_;
   if (current_pillar_index_ < pillar_targets_.size()) {
     phase_ = MissionPhase::VISIT_PILLAR;
     current_target_ = pillar_targets_[current_pillar_index_];
+    resetCurrentPillarSamples();
+    publishHeightFilterEnabled(true);
     publishTarget(current_target_);
     return;
   }
 
   phase_ = MissionPhase::GO_TO_LAND_POINT;
+  publishHeightFilterEnabled(false);
   current_target_ = Target{landing_x_cm_, landing_y_cm_, cruise_height_cm_, mission_yaw_deg_};
   publishTarget(current_target_);
 }
@@ -546,6 +621,7 @@ void RouteTargetPublisherNode::completeMission(const std::string & reason)
   has_current_target_ = false;
   publishVisualTakeoverState(false);
   publishOnPillar(false);
+  publishHeightFilterEnabled(false);
   publishActiveController(3);
 
   if (!mission_complete_sent_) {
@@ -589,13 +665,14 @@ void RouteTargetPublisherNode::monitorTimerCallback()
       get_logger(),
       *get_clock(),
       1000,
-      "Hovering on pillar %zu/%zu: elapsed=%.1fs/%.1fs latest_circle_rank=%d samples=%zu",
+      "Hovering on pillar %zu/%zu: elapsed=%.1fs/%.1fs latest_circle_rank=%d ground_samples=%zu min_samples=%zu",
       current_pillar_index_ + 1,
       pillar_targets_.size(),
       elapsed_sec,
       hover_time_sec_,
       latest_circle_rank_,
-      hover_height_sample_count_);
+      pillar_ground_height_sample_count_,
+      pillar_min_range_sample_count_);
 
     if (elapsed_sec >= hover_time_sec_) {
       finishCurrentPillarMeasurement();
@@ -656,6 +733,8 @@ void RouteTargetPublisherNode::monitorTimerCallback()
     case MissionPhase::TAKEOFF_TO_CRUISE:
       phase_ = MissionPhase::VISIT_PILLAR;
       current_target_ = pillar_targets_[current_pillar_index_];
+      resetCurrentPillarSamples();
+      publishHeightFilterEnabled(true);
       publishTarget(current_target_);
       break;
 
@@ -667,6 +746,7 @@ void RouteTargetPublisherNode::monitorTimerCallback()
       phase_ = MissionPhase::LAND_ALIGN;
       land_align_start_time_ = now();
       publishVisualTakeoverState(true);
+      publishHeightFilterEnabled(false);
       current_target_ = Target{landing_x_cm_, landing_y_cm_, cruise_height_cm_, mission_yaw_deg_};
       publishTarget(current_target_);
       break;

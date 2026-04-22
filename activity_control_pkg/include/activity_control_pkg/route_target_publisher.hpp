@@ -12,8 +12,8 @@
 #include <rclcpp/rclcpp.hpp>
 #include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/empty.hpp>
+#include <std_msgs/msg/float32.hpp>
 #include <std_msgs/msg/float32_multi_array.hpp>
-#include <std_msgs/msg/int16.hpp>
 #include <std_msgs/msg/int32.hpp>
 #include <std_msgs/msg/int32_multi_array.hpp>
 #include <std_msgs/msg/u_int8.hpp>
@@ -72,6 +72,7 @@ private:
   void publishTarget(const Target & target);
   void publishActiveController(std::uint8_t controller_id);
   void publishVisualTakeoverState(bool active);
+  void publishHeightFilterEnabled(bool enabled);
   void publishPillarTaskResult(const PillarTaskResult & result);
   void publishPillarTaskSummary();
   void logMissionSummary() const;
@@ -81,13 +82,14 @@ private:
   double normalizeAngleDeg(double angle_deg) const;
 
   void pillarPositionCallback(const std_msgs::msg::Float32MultiArray::SharedPtr msg);
-  void heightCallback(const std_msgs::msg::Int16::SharedPtr msg);
-  void heightRawCallback(const std_msgs::msg::Int16::SharedPtr msg);
+  void groundHeightCallback(const std_msgs::msg::Float32::SharedPtr msg);
+  void minRangeCallback(const std_msgs::msg::Float32::SharedPtr msg);
   void circleRankCallback(const std_msgs::msg::Int32::SharedPtr msg);
   void circleCenterCallback(const geometry_msgs::msg::PointStamped::SharedPtr msg);
   void monitorTimerCallback();
 
   void startHoverMeasurement();
+  void resetCurrentPillarSamples();
   void sampleHoverMeasurement();
   void finishCurrentPillarMeasurement();
   void completeMission(const std::string & reason);
@@ -106,8 +108,8 @@ private:
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr on_pillar_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr height_filter_enabled_pub_;
 
-  rclcpp::Subscription<std_msgs::msg::Int16>::SharedPtr height_sub_;
-  rclcpp::Subscription<std_msgs::msg::Int16>::SharedPtr height_raw_sub_;
+  rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr ground_height_sub_;
+  rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr min_range_sub_;
   rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr circle_rank_sub_;
   rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr pillar_position_sub_;
   rclcpp::Subscription<geometry_msgs::msg::PointStamped>::SharedPtr circle_center_sub_;
@@ -129,6 +131,7 @@ private:
   double start_x_cm_;
   double start_y_cm_;
   double cruise_height_cm_;
+  double height_band_cm_;
   double landing_x_cm_;
   double landing_y_cm_;
   double mission_yaw_deg_;
@@ -152,8 +155,12 @@ private:
   std::vector<PillarTaskSummarySlot> pillar_summary_slots_;
 
   rclcpp::Time hover_start_time_;
-  double hover_height_sum_cm_;
-  std::size_t hover_height_sample_count_;
+  bool pillar_ground_height_valid_;
+  double pillar_ground_height_max_m_;
+  bool pillar_min_range_valid_;
+  double pillar_min_range_min_m_;
+  std::size_t pillar_ground_height_sample_count_;
+  std::size_t pillar_min_range_sample_count_;
   std::map<int, int> hover_circle_rank_counts_;
 
   rclcpp::Time land_align_start_time_;

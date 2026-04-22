@@ -165,8 +165,8 @@ PositionPIDController::PositionPIDController()
   target_position_sub_ = create_subscription<std_msgs::msg::Float32MultiArray>(
     "/target_position", rclcpp::QoS(10),
     std::bind(&PositionPIDController::targetPositionCallback, this, std::placeholders::_1));
-  height_sub_ = create_subscription<std_msgs::msg::Int16>(
-    "/height", rclcpp::QoS(10),
+  height_sub_ = create_subscription<std_msgs::msg::Float32>(
+    "/laser_array/ground_height", rclcpp::QoS(10),
     std::bind(&PositionPIDController::heightCallback, this, std::placeholders::_1));
 
   auto takeover_qos = rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable();
@@ -187,6 +187,7 @@ PositionPIDController::PositionPIDController()
 
   RCLCPP_INFO(get_logger(), "Position PID Controller initialized (%.1f Hz)", control_frequency_);
   RCLCPP_INFO(get_logger(), "Frames: map=%s, laser_link=%s", map_frame_.c_str(), laser_link_frame_.c_str());
+  RCLCPP_INFO(get_logger(), "Height source: /laser_array/ground_height");
 }
 
 void PositionPIDController::targetPositionCallback(const std_msgs::msg::Float32MultiArray::SharedPtr msg)
@@ -207,9 +208,16 @@ void PositionPIDController::targetPositionCallback(const std_msgs::msg::Float32M
     target_x_cm_, target_y_cm_, target_z_cm_, target_yaw_deg_);
 }
 
-void PositionPIDController::heightCallback(const std_msgs::msg::Int16::SharedPtr msg)
+void PositionPIDController::heightCallback(const std_msgs::msg::Float32::SharedPtr msg)
 {
-  current_z_cm_ = static_cast<double>(msg->data);
+  if (!std::isfinite(msg->data)) {
+    RCLCPP_WARN_THROTTLE(
+      get_logger(), *get_clock(), 2000,
+      "Ignoring non-finite /laser_array/ground_height sample.");
+    return;
+  }
+
+  current_z_cm_ = meterToCm(static_cast<double>(msg->data));
   has_target_height_ = true;
 }
 
@@ -308,8 +316,8 @@ std_msgs::msg::Float32MultiArray PositionPIDController::processPID(double dt)
   if (visual_takeover_active_) {
     const rclcpp::Time now_time = now();
     if (hasFreshVisualData(now_time)) {
-      vel_x_cm = pid_visual_x_.calculate(0.0, -visual_error_x_px_, dt);
-      vel_y_cm = pid_visual_y_.calculate(0.0, -visual_error_y_px_, dt);
+      vel_x_cm = pid_visual_y_.calculate(0.0, -visual_error_y_px_, dt);
+      vel_y_cm = pid_visual_x_.calculate(0.0, visual_error_x_px_, dt);
     } else {
       vel_x_cm = 0.0;
       vel_y_cm = 0.0;
@@ -343,7 +351,8 @@ std_msgs::msg::Float32MultiArray PositionPIDController::processPID(double dt)
   } else {
     if (std::fabs(target_z_cm_) > 1.0) {
       RCLCPP_WARN_THROTTLE(get_logger(), *get_clock(), 2000,
-        "Waiting for height data... Z velocity suppressed (Target Z=%.1f)", target_z_cm_);
+        "Waiting for /laser_array/ground_height... Z velocity suppressed (Target Z=%.1f)",
+        target_z_cm_);
     }
     vel_z_cm = 0.0;
   }

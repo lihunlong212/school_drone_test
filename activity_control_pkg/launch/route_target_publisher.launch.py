@@ -22,6 +22,7 @@ def generate_launch_description():
         "start_x_cm": 0.0,
         "start_y_cm": 0.0,
         "cruise_height_cm": 130.0,
+        "height_band_cm": 20.0,
         "landing_x_cm": 250.0,
         "landing_y_cm": -250.0,
         "mission_yaw_deg": 0.0,
