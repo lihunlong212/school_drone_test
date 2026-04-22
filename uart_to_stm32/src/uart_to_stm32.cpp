@@ -21,7 +21,12 @@ UartToStm32::UartToStm32(rclcpp::Node::SharedPtr node)
   yaw_valid_(false),
   velocity_valid_(false),
   route_task_active_(false),
-  has_st_ready_pub_(false)
+  has_st_ready_pub_(false),
+  last_height_valid_(false),
+  last_published_height_cm_(0),
+  jump_suppress_count_(0),
+  pillar_jump_threshold_cm_(35),
+  pillar_jump_recover_count_(10)
 {
   RCLCPP_INFO(node_->get_logger(), "UartToStm32 created");
 }
@@ -80,6 +85,19 @@ bool UartToStm32::initialize(double update_rate, const std::string & source_fram
     mission_complete_sub_ = node_->create_subscription<std_msgs::msg::Empty>(
       "/mission_complete", rclcpp::QoS(10),
       std::bind(&UartToStm32::missionCompleteCallback, this, std::placeholders::_1));
+
+    pillar_jump_threshold_cm_ = static_cast<int>(
+      node_->declare_parameter<int>("pillar_jump_threshold_cm", 35));
+    pillar_jump_recover_count_ = static_cast<int>(
+      node_->declare_parameter<int>("pillar_jump_recover_count", 10));
+
+    const auto on_pillar_qos = rclcpp::QoS(rclcpp::KeepLast(1)).transient_local().reliable();
+    on_pillar_sub_ = node_->create_subscription<std_msgs::msg::Bool>(
+      "/on_pillar", on_pillar_qos,
+      std::bind(&UartToStm32::onPillarCallback, this, std::placeholders::_1));
+
+    pillar_signal_timer_ = node_->create_wall_timer(
+      1s, std::bind(&UartToStm32::pillarSignalTimerCallback, this));
 
     height_pub_ = node_->create_publisher<std_msgs::msg::Int16>("/height", 10);
     is_st_ready_pub_ =
@@ -362,14 +380,7 @@ void UartToStm32::protocolDataHandler(uint8_t id, const std::vector<uint8_t> & d
       }
       const int16_t value = static_cast<int16_t>(
         static_cast<uint16_t>(data[0]) | (static_cast<uint16_t>(data[1]) << 8));
-      std_msgs::msg::Int16 msg;
-      msg.data = value;
-      if (height_pub_) {
-        height_pub_->publish(msg);
-        RCLCPP_INFO_THROTTLE(node_->get_logger(), *node_->get_clock(), 1000, "Published /height: %d", value);
-      } else {
-        RCLCPP_WARN(node_->get_logger(), "Height publisher not initialized");
-      }
+      publishFilteredHeight(value);
       break;
     }
     case 0xB1: {
@@ -437,6 +448,83 @@ void UartToStm32::missionCompleteCallback(const std_msgs::msg::Empty::SharedPtr)
   RCLCPP_INFO(
     node_->get_logger(),
     "Mission complete sent. Target velocity forwarding is now disabled until /active_controller=2.");
+}
+
+void UartToStm32::onPillarCallback(const std_msgs::msg::Bool::SharedPtr msg)
+{
+  const bool new_state = msg->data;
+  const bool prev = on_pillar_.exchange(new_state);
+  if (prev != new_state) {
+    RCLCPP_INFO(
+      node_->get_logger(),
+      "/on_pillar changed: %s -> %s", prev ? "true" : "false", new_state ? "true" : "false");
+  }
+}
+
+void UartToStm32::pillarSignalTimerCallback()
+{
+  if (!serial_comm_ || !serial_comm_->is_open()) {
+    return;
+  }
+
+  const uint8_t payload = on_pillar_.load() ? uint8_t{0x01} : uint8_t{0x00};
+  const std::vector<uint8_t> data(1, payload);
+
+  if (!serial_comm_->send_protocol_data(PILLAR_SIGNAL_FRAME_ID, 1, data)) {
+    RCLCPP_WARN_THROTTLE(
+      node_->get_logger(), *node_->get_clock(), 5000,
+      "Failed to send pillar signal frame 0x22: %s",
+      serial_comm_->get_last_error().c_str());
+    return;
+  }
+
+  RCLCPP_DEBUG_THROTTLE(
+    node_->get_logger(), *node_->get_clock(), 2000,
+    "Sent pillar signal: 0x22/0x%02X", static_cast<unsigned>(payload));
+}
+
+void UartToStm32::publishFilteredHeight(int16_t raw_value_cm)
+{
+  if (!height_pub_) {
+    RCLCPP_WARN(node_->get_logger(), "Height publisher not initialized");
+    return;
+  }
+
+  int16_t out_value = raw_value_cm;
+
+  if (last_height_valid_) {
+    const int diff = std::abs(static_cast<int>(raw_value_cm) - static_cast<int>(last_published_height_cm_));
+    if (diff > pillar_jump_threshold_cm_) {
+      ++jump_suppress_count_;
+      if (jump_suppress_count_ < pillar_jump_recover_count_) {
+        out_value = last_published_height_cm_;
+        RCLCPP_DEBUG_THROTTLE(
+          node_->get_logger(), *node_->get_clock(), 500,
+          "Suppressing height jump: raw=%d last=%d diff=%d (count=%d/%d)",
+          raw_value_cm, last_published_height_cm_, diff,
+          jump_suppress_count_, pillar_jump_recover_count_);
+      } else {
+        RCLCPP_INFO(
+          node_->get_logger(),
+          "Height jump persisted for %d samples, accepting new value: %d -> %d",
+          pillar_jump_recover_count_, last_published_height_cm_, raw_value_cm);
+        jump_suppress_count_ = 0;
+      }
+    } else {
+      jump_suppress_count_ = 0;
+    }
+  }
+
+  std_msgs::msg::Int16 msg;
+  msg.data = out_value;
+  height_pub_->publish(msg);
+
+  last_published_height_cm_ = out_value;
+  last_height_valid_ = true;
+
+  RCLCPP_INFO_THROTTLE(
+    node_->get_logger(), *node_->get_clock(), 1000,
+    "Published /height: %d (raw=%d)", out_value, raw_value_cm);
 }
 
 }  // namespace uart_to_stm32

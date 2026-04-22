@@ -36,11 +36,12 @@ RouteTargetPublisherNode::RouteTargetPublisherNode(const rclcpp::NodeOptions & o
   start_x_cm_(declare_parameter("start_x_cm", 0.0)),
   start_y_cm_(declare_parameter("start_y_cm", 0.0)),
   cruise_height_cm_(declare_parameter("cruise_height_cm", 130.0)),
-  landing_x_cm_(declare_parameter("landing_x_cm", 0.0)),
-  landing_y_cm_(declare_parameter("landing_y_cm", 0.0)),
+  landing_x_cm_(declare_parameter("landing_x_cm", 250.0)),
+  landing_y_cm_(declare_parameter("landing_y_cm", -250.0)),
   mission_yaw_deg_(declare_parameter("mission_yaw_deg", 0.0)),
   hover_time_sec_(declare_parameter("hover_time_sec", 5.0)),
   pillar_height_threshold_cm_(declare_parameter("pillar_height_threshold_cm", 40.0)),
+  landing_align_time_sec_(declare_parameter("landing_align_time_sec", 3.0)),
   has_height_(false),
   current_height_cm_(0.0),
   latest_circle_rank_(0),
@@ -73,6 +74,8 @@ RouteTargetPublisherNode::RouteTargetPublisherNode(const rclcpp::NodeOptions & o
     create_publisher<std_msgs::msg::Float32MultiArray>("/pillar_task_summary", durable_qos);
   fine_data_pub_ =
     create_publisher<std_msgs::msg::Int32MultiArray>("/fine_data", rclcpp::QoS(10));
+  on_pillar_pub_ =
+    create_publisher<std_msgs::msg::Bool>("/on_pillar", durable_qos);
 
   height_sub_ = create_subscription<std_msgs::msg::Int16>(
     "/height",
@@ -96,6 +99,7 @@ RouteTargetPublisherNode::RouteTargetPublisherNode(const rclcpp::NodeOptions & o
     std::bind(&RouteTargetPublisherNode::monitorTimerCallback, this));
 
   publishVisualTakeoverState(false);
+  publishOnPillar(false);
   publishActiveController(3);
 
   RCLCPP_INFO(
@@ -151,6 +155,16 @@ void RouteTargetPublisherNode::publishVisualTakeoverState(bool active)
   std_msgs::msg::Bool message;
   message.data = active;
   visual_takeover_active_pub_->publish(message);
+}
+
+void RouteTargetPublisherNode::publishOnPillar(bool active)
+{
+  if (!on_pillar_pub_) {
+    return;
+  }
+  std_msgs::msg::Bool message;
+  message.data = active;
+  on_pillar_pub_->publish(message);
 }
 
 void RouteTargetPublisherNode::publishPillarTaskResult(const PillarTaskResult & result)
@@ -394,7 +408,12 @@ void RouteTargetPublisherNode::circleCenterCallback(
 {
   std::lock_guard<std::mutex> lock(mutex_);
 
-  if (phase_ != MissionPhase::HOVER_AND_MEASURE || !fine_data_pub_) {
+  const bool forward_phase =
+    phase_ == MissionPhase::HOVER_AND_MEASURE ||
+    phase_ == MissionPhase::LAND_ALIGN ||
+    phase_ == MissionPhase::LAND;
+
+  if (!forward_phase || !fine_data_pub_) {
     return;
   }
 
@@ -408,7 +427,8 @@ void RouteTargetPublisherNode::circleCenterCallback(
     get_logger(),
     *get_clock(),
     500,
-    "Forwarding /circle_center to /fine_data during hover: x=%d y=%d",
+    "Forwarding /circle_center to /fine_data (phase=%u): x=%d y=%d",
+    static_cast<unsigned>(phase_),
     fine_data_msg.data[0],
     fine_data_msg.data[1]);
 }
@@ -421,6 +441,7 @@ void RouteTargetPublisherNode::startHoverMeasurement()
   hover_height_sample_count_ = 0;
   hover_circle_rank_counts_.clear();
   publishVisualTakeoverState(true);
+  publishOnPillar(true);
 
   if (current_pillar_index_ < pillar_summary_slots_.size()) {
     pillar_summary_slots_[current_pillar_index_].status = kSummaryStatusMeasuring;
@@ -451,6 +472,7 @@ void RouteTargetPublisherNode::sampleHoverMeasurement()
 
 void RouteTargetPublisherNode::finishCurrentPillarMeasurement()
 {
+  publishOnPillar(false);
   publishVisualTakeoverState(false);
 
   const double avg_height_cm = hover_height_sample_count_ > 0
@@ -523,6 +545,7 @@ void RouteTargetPublisherNode::completeMission(const std::string & reason)
   phase_ = MissionPhase::COMPLETE;
   has_current_target_ = false;
   publishVisualTakeoverState(false);
+  publishOnPillar(false);
   publishActiveController(3);
 
   if (!mission_complete_sent_) {
@@ -580,6 +603,24 @@ void RouteTargetPublisherNode::monitorTimerCallback()
     return;
   }
 
+  if (phase_ == MissionPhase::LAND_ALIGN) {
+    const double elapsed_sec = (now() - land_align_start_time_).seconds();
+    RCLCPP_INFO_THROTTLE(
+      get_logger(),
+      *get_clock(),
+      1000,
+      "Landing align: elapsed=%.1fs/%.1fs",
+      elapsed_sec,
+      landing_align_time_sec_);
+
+    if (elapsed_sec >= landing_align_time_sec_) {
+      phase_ = MissionPhase::LAND;
+      current_target_ = Target{landing_x_cm_, landing_y_cm_, 0.0, mission_yaw_deg_};
+      publishTarget(current_target_);
+    }
+    return;
+  }
+
   if (!has_current_target_) {
     return;
   }
@@ -623,8 +664,10 @@ void RouteTargetPublisherNode::monitorTimerCallback()
       break;
 
     case MissionPhase::GO_TO_LAND_POINT:
-      phase_ = MissionPhase::LAND;
-      current_target_ = Target{landing_x_cm_, landing_y_cm_, 0.0, mission_yaw_deg_};
+      phase_ = MissionPhase::LAND_ALIGN;
+      land_align_start_time_ = now();
+      publishVisualTakeoverState(true);
+      current_target_ = Target{landing_x_cm_, landing_y_cm_, cruise_height_cm_, mission_yaw_deg_};
       publishTarget(current_target_);
       break;
 
@@ -634,6 +677,7 @@ void RouteTargetPublisherNode::monitorTimerCallback()
 
     case MissionPhase::WAIT_PILLARS:
     case MissionPhase::HOVER_AND_MEASURE:
+    case MissionPhase::LAND_ALIGN:
     case MissionPhase::COMPLETE:
       break;
   }
