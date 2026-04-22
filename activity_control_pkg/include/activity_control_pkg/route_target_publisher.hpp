@@ -58,8 +58,9 @@ enum class MissionPhase : std::uint8_t
   VISIT_PILLAR = 2,
   HOVER_AND_MEASURE = 3,
   GO_TO_LAND_POINT = 4,
-  LAND = 5,
-  COMPLETE = 6,
+  LAND_ALIGN = 5,
+  LAND = 6,
+  COMPLETE = 7,
 };
 
 class RouteTargetPublisherNode : public rclcpp::Node
@@ -101,6 +102,7 @@ private:
   rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr pillar_task_result_pub_;
   rclcpp::Publisher<std_msgs::msg::Float32MultiArray>::SharedPtr pillar_task_summary_pub_;
   rclcpp::Publisher<std_msgs::msg::Int32MultiArray>::SharedPtr fine_data_pub_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr on_pillar_pub_;
 
   rclcpp::Subscription<std_msgs::msg::Int16>::SharedPtr height_sub_;
   rclcpp::Subscription<std_msgs::msg::Int32>::SharedPtr circle_rank_sub_;
@@ -129,6 +131,7 @@ private:
   double mission_yaw_deg_;
   double hover_time_sec_;
   double pillar_height_threshold_cm_;
+  double landing_align_time_sec_;
 
   bool has_height_;
   double current_height_cm_;
@@ -149,6 +152,10 @@ private:
   double hover_height_sum_cm_;
   std::size_t hover_height_sample_count_;
   std::map<int, int> hover_circle_rank_counts_;
+
+  rclcpp::Time land_align_start_time_;
+
+  void publishOnPillar(bool active);
 };
 
 }  // namespace activity_control_pkg

@@ -1,6 +1,7 @@
 #ifndef UART_TO_STM32__UART_TO_STM32_HPP_
 #define UART_TO_STM32__UART_TO_STM32_HPP_
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <vector>
@@ -11,6 +12,7 @@
 #include <geometry_msgs/msg/twist.hpp>
 #include <rclcpp/rclcpp.hpp>
 #include <serial_comm/serial_comm.h>
+#include <std_msgs/msg/bool.hpp>
 #include <std_msgs/msg/empty.hpp>
 #include <std_msgs/msg/float32_multi_array.hpp>
 #include <std_msgs/msg/int16.hpp>
@@ -37,7 +39,10 @@ private:
   void velocityCallback(const geometry_msgs::msg::Twist::SharedPtr msg);
   void targetVelocityCallback(const std_msgs::msg::Float32MultiArray::SharedPtr msg);
   void missionCompleteCallback(const std_msgs::msg::Empty::SharedPtr msg);
+  void onPillarCallback(const std_msgs::msg::Bool::SharedPtr msg);
+  void pillarSignalTimerCallback();
   void protocolDataHandler(uint8_t id, const std::vector<uint8_t> & data);
+  void publishFilteredHeight(int16_t raw_value_cm);
 
   Eigen::Vector3d transformVelocity(const Eigen::Vector3d & linear, double yaw);
   void sendVelocityToSerial(const Eigen::Vector3d & transformed_velocity);
@@ -56,6 +61,8 @@ private:
   rclcpp::Subscription<std_msgs::msg::UInt8>::SharedPtr active_controller_sub_;
   rclcpp::Subscription<std_msgs::msg::Float32MultiArray>::SharedPtr target_velocity_sub_;
   rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr mission_complete_sub_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr on_pillar_sub_;
+  rclcpp::TimerBase::SharedPtr pillar_signal_timer_;
 
   std::unique_ptr<serial_comm::SerialComm> serial_comm_;
 
@@ -70,11 +77,20 @@ private:
   bool route_task_active_;
   bool has_st_ready_pub_;
 
+  std::atomic<bool> on_pillar_{false};
+
+  bool last_height_valid_;
+  int16_t last_published_height_cm_;
+  int jump_suppress_count_;
+  int pillar_jump_threshold_cm_;
+  int pillar_jump_recover_count_;
+
   static constexpr uint8_t VELOCITY_FRAME_ID = 0x32;
   static constexpr uint8_t TARGET_VELOCITY_FRAME_ID = 0x31;
   static constexpr uint8_t ST_READY_QUERY_ID = 0xF1;
   static constexpr uint8_t MISSION_COMPLETE_FRAME_ID = 0x66;
   static constexpr uint8_t MISSION_COMPLETE_VALUE = 0x06;
+  static constexpr uint8_t PILLAR_SIGNAL_FRAME_ID = 0x22;
 };
 
 }  // namespace uart_to_stm32

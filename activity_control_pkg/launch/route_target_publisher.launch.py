@@ -22,11 +22,12 @@ def generate_launch_description():
         "start_x_cm": 0.0,
         "start_y_cm": 0.0,
         "cruise_height_cm": 130.0,
-        "landing_x_cm": 0.0,
-        "landing_y_cm": 0.0,
+        "landing_x_cm": 250.0,
+        "landing_y_cm": -250.0,
         "mission_yaw_deg": 0.0,
         "hover_time_sec": 5.0,
         "pillar_height_threshold_cm": 40.0,
+        "landing_align_time_sec": 3.0,
     }
 
     return LaunchDescription([
