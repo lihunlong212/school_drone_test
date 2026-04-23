@@ -95,6 +95,9 @@ bool UartToStm32::initialize(double update_rate, const std::string & source_fram
     height_filter_enabled_sub_ = node_->create_subscription<std_msgs::msg::Bool>(
       "/height_filter_enabled", latched_qos,
       std::bind(&UartToStm32::heightFilterEnabledCallback, this, std::placeholders::_1));
+    servo_command_sub_ = node_->create_subscription<std_msgs::msg::Bool>(
+      "/servo_command", rclcpp::QoS(10).reliable(),
+      std::bind(&UartToStm32::servoCommandCallback, this, std::placeholders::_1));
 
     pillar_signal_timer_ = node_->create_wall_timer(
       1s, std::bind(&UartToStm32::pillarSignalTimerCallback, this));
@@ -482,6 +485,33 @@ void UartToStm32::pillarSignalTimerCallback()
   RCLCPP_DEBUG_THROTTLE(
     node_->get_logger(), *node_->get_clock(), 2000,
     "Sent pillar signal: 0x22/0x%02X", static_cast<unsigned>(payload));
+}
+
+void UartToStm32::servoCommandCallback(const std_msgs::msg::Bool::SharedPtr msg)
+{
+  if (!serial_comm_ || !serial_comm_->is_open()) {
+    RCLCPP_WARN_THROTTLE(
+      node_->get_logger(), *node_->get_clock(), 5000,
+      "Serial port is not open, cannot send servo command");
+    return;
+  }
+
+  const uint8_t payload = msg->data ? uint8_t{0x01} : uint8_t{0x00};
+  const std::vector<uint8_t> data(1, payload);
+
+  if (serial_comm_->send_protocol_data(SERVO_FRAME_ID, 1, data)) {
+    RCLCPP_INFO(
+      node_->get_logger(),
+      "Sent servo command: 0x%02X/0x%02X (%s)",
+      static_cast<unsigned>(SERVO_FRAME_ID),
+      static_cast<unsigned>(payload),
+      msg->data ? "down" : "up");
+  } else {
+    RCLCPP_WARN(
+      node_->get_logger(),
+      "Failed to send servo command: %s",
+      serial_comm_->get_last_error().c_str());
+  }
 }
 
 void UartToStm32::heightFilterEnabledCallback(const std_msgs::msg::Bool::SharedPtr msg)

@@ -47,6 +47,13 @@ RouteTargetPublisherNode::RouteTargetPublisherNode(const rclcpp::NodeOptions & o
   landing_align_time_sec_(declare_parameter("landing_align_time_sec", 3.0)),
   visual_alignment_tolerance_px_(declare_parameter("visual_alignment_tolerance_px", 20.0)),
   visual_alignment_timeout_sec_(declare_parameter("visual_alignment_timeout_sec", 0.5)),
+  delivery_phase_enable_(declare_parameter("delivery_phase_enable", false)),
+  pickup_clearance_cm_(declare_parameter("pickup_clearance_cm", 20.0)),
+  drop_clearance_cm_(declare_parameter("drop_clearance_cm", 20.0)),
+  pickup_hold_sec_(declare_parameter("pickup_hold_sec", 3.0)),
+  drop_hold_sec_(declare_parameter("drop_hold_sec", 1.0)),
+  pickup_retry_max_(static_cast<int>(declare_parameter("pickup_retry_max", 3))),
+  delivery_align_settle_sec_(declare_parameter("delivery_align_settle_sec", 1.5)),
   has_height_(false),
   current_height_cm_(0.0),
   latest_circle_rank_(0),
@@ -64,7 +71,12 @@ RouteTargetPublisherNode::RouteTargetPublisherNode(const rclcpp::NodeOptions & o
   pillar_min_range_sample_count_(0),
   hover_visual_error_x_px_(0.0),
   hover_visual_error_y_px_(0.0),
-  hover_has_visual_alignment_(false)
+  hover_has_visual_alignment_(false),
+  empty_pillar_index_(0),
+  empty_pillar_valid_(false),
+  delivery_step_(0),
+  pickup_retry_count_(0),
+  delivery_align_started_(false)
 {
   map_frame_ = declare_parameter("map_frame", "map");
   laser_link_frame_ = declare_parameter("laser_link_frame", "laser_link");
@@ -90,6 +102,10 @@ RouteTargetPublisherNode::RouteTargetPublisherNode(const rclcpp::NodeOptions & o
     create_publisher<std_msgs::msg::Bool>("/on_pillar", durable_qos);
   height_filter_enabled_pub_ =
     create_publisher<std_msgs::msg::Bool>("/height_filter_enabled", durable_qos);
+  magnet_command_pub_ =
+    create_publisher<std_msgs::msg::Bool>("/magnet_command", durable_qos);
+  servo_command_pub_ =
+    create_publisher<std_msgs::msg::Bool>("/servo_command", rclcpp::QoS(10).reliable());
 
   ground_height_sub_ = create_subscription<std_msgs::msg::Float32>(
     "/laser_array/ground_height",
@@ -120,6 +136,8 @@ RouteTargetPublisherNode::RouteTargetPublisherNode(const rclcpp::NodeOptions & o
   publishOnPillar(false);
   publishHeightFilterEnabled(false);
   publishActiveController(3);
+  publishMagnetCommand(false);
+  publishServoCommand(false);
 
   RCLCPP_INFO(
     get_logger(),
@@ -513,7 +531,11 @@ void RouteTargetPublisherNode::circleCenterCallback(
   const bool forward_phase =
     phase_ == MissionPhase::HOVER_AND_MEASURE ||
     phase_ == MissionPhase::LAND_ALIGN ||
-    phase_ == MissionPhase::LAND;
+    phase_ == MissionPhase::LAND ||
+    phase_ == MissionPhase::DELIVERY_DESCEND_PICK ||
+    phase_ == MissionPhase::DELIVERY_PICK_HOLD ||
+    phase_ == MissionPhase::DELIVERY_DESCEND_DROP ||
+    phase_ == MissionPhase::DELIVERY_DROP_HOLD;
 
   if (!forward_phase || !fine_data_pub_) {
     return;
@@ -529,7 +551,11 @@ void RouteTargetPublisherNode::circleCenterCallback(
   fine_data_msg.data[1] = static_cast<std::int32_t>(std::lround(msg->point.y));
   fine_data_pub_->publish(fine_data_msg);
 
-  if (phase_ == MissionPhase::HOVER_AND_MEASURE) {
+  if (phase_ == MissionPhase::HOVER_AND_MEASURE ||
+      phase_ == MissionPhase::DELIVERY_DESCEND_PICK ||
+      phase_ == MissionPhase::DELIVERY_PICK_HOLD ||
+      phase_ == MissionPhase::DELIVERY_DESCEND_DROP ||
+      phase_ == MissionPhase::DELIVERY_DROP_HOLD) {
     hover_visual_error_x_px_ = msg->point.x;
     hover_visual_error_y_px_ = msg->point.y;
     hover_last_visual_sample_time_ = now();
@@ -672,10 +698,185 @@ void RouteTargetPublisherNode::finishCurrentPillarMeasurement()
     return;
   }
 
+  if (delivery_phase_enable_) {
+    if (planDeliveryOrder()) {
+      startDeliveryPhase();
+      return;
+    }
+    RCLCPP_WARN(
+      get_logger(),
+      "delivery_phase_enable=true but pillar plan invalid (need 1 empty + ranks {1,2,3}); falling back to landing.");
+  }
+
+  startGoToLanding();
+}
+
+void RouteTargetPublisherNode::startGoToLanding()
+{
   phase_ = MissionPhase::GO_TO_LAND_POINT;
   publishHeightFilterEnabled(false);
+  publishVisualTakeoverState(false);
+  publishOnPillar(false);
+  publishMagnetCommand(false);
+  publishServoCommand(false);
   current_target_ = Target{landing_x_cm_, landing_y_cm_, cruise_height_cm_, mission_yaw_deg_};
   publishTarget(current_target_);
+}
+
+bool RouteTargetPublisherNode::planDeliveryOrder()
+{
+  empty_pillar_valid_ = false;
+  delivery_pickup_order_.clear();
+
+  std::vector<std::size_t> rank_to_pillar(4, std::numeric_limits<std::size_t>::max());
+  std::size_t empty_candidate = std::numeric_limits<std::size_t>::max();
+
+  for (std::size_t i = 0; i < pillar_summary_slots_.size(); ++i) {
+    const auto & slot = pillar_summary_slots_[i];
+    if (slot.status != kSummaryStatusDone) {
+      continue;
+    }
+    const int rank = slot.circle_rank;
+    if (rank == 0) {
+      if (empty_candidate == std::numeric_limits<std::size_t>::max()) {
+        empty_candidate = i;
+      }
+    } else if (rank >= 1 && rank <= 3) {
+      if (rank_to_pillar[rank] == std::numeric_limits<std::size_t>::max()) {
+        rank_to_pillar[rank] = i;
+      }
+    }
+  }
+
+  if (empty_candidate == std::numeric_limits<std::size_t>::max()) {
+    return false;
+  }
+  for (int r = 1; r <= 3; ++r) {
+    if (rank_to_pillar[r] == std::numeric_limits<std::size_t>::max()) {
+      return false;
+    }
+  }
+
+  empty_pillar_index_ = empty_candidate;
+  empty_pillar_valid_ = true;
+  delivery_pickup_order_ = {rank_to_pillar[1], rank_to_pillar[2], rank_to_pillar[3]};
+  delivery_step_ = 0;
+  pickup_retry_count_ = 0;
+
+  RCLCPP_INFO(
+    get_logger(),
+    "Delivery plan: empty=%zu, pickup order (rank 1->2->3): %zu, %zu, %zu",
+    empty_pillar_index_ + 1,
+    delivery_pickup_order_[0] + 1,
+    delivery_pickup_order_[1] + 1,
+    delivery_pickup_order_[2] + 1);
+
+  return true;
+}
+
+void RouteTargetPublisherNode::startDeliveryPhase()
+{
+  delivery_phase_start_time_ = now();
+  beginDeliveryPickup();
+}
+
+void RouteTargetPublisherNode::beginDeliveryPickup()
+{
+  if (delivery_step_ >= delivery_pickup_order_.size()) {
+    startGoToLanding();
+    return;
+  }
+
+  const std::size_t pillar_idx = delivery_pickup_order_[delivery_step_];
+  const Target & pillar = pillar_targets_[pillar_idx];
+
+  phase_ = MissionPhase::DELIVERY_GOTO_PICK;
+  pickup_retry_count_ = 0;
+  delivery_align_started_ = false;
+  publishHeightFilterEnabled(false);
+  publishVisualTakeoverState(false);
+  publishOnPillar(false);
+  publishMagnetCommand(false);
+  publishServoCommand(false);
+
+  current_target_ = Target{pillar.x_cm, pillar.y_cm, cruise_height_cm_, mission_yaw_deg_};
+
+  RCLCPP_INFO(
+    get_logger(),
+    "Delivery step %zu/%zu: GOTO_PICK pillar=%zu rank=%d",
+    delivery_step_ + 1,
+    delivery_pickup_order_.size(),
+    pillar_idx + 1,
+    static_cast<int>(delivery_step_ + 1));
+
+  publishTarget(current_target_);
+}
+
+void RouteTargetPublisherNode::beginDeliveryDrop()
+{
+  if (!empty_pillar_valid_) {
+    startGoToLanding();
+    return;
+  }
+
+  const Target & empty_target = pillar_targets_[empty_pillar_index_];
+  phase_ = MissionPhase::DELIVERY_GOTO_DROP;
+  delivery_align_started_ = false;
+  publishHeightFilterEnabled(false);
+  publishVisualTakeoverState(false);
+  publishOnPillar(false);
+
+  current_target_ = Target{empty_target.x_cm, empty_target.y_cm, cruise_height_cm_, mission_yaw_deg_};
+
+  RCLCPP_INFO(
+    get_logger(),
+    "Delivery step %zu/%zu: GOTO_DROP pillar=%zu",
+    delivery_step_ + 1,
+    delivery_pickup_order_.size(),
+    empty_pillar_index_ + 1);
+
+  publishTarget(current_target_);
+}
+
+void RouteTargetPublisherNode::advanceDeliveryStep()
+{
+  ++delivery_step_;
+  beginDeliveryPickup();
+}
+
+void RouteTargetPublisherNode::publishMagnetCommand(bool energize)
+{
+  if (!magnet_command_pub_) {
+    return;
+  }
+  std_msgs::msg::Bool msg;
+  msg.data = energize;
+  magnet_command_pub_->publish(msg);
+  RCLCPP_INFO(get_logger(), "Magnet command -> %s", energize ? "ON" : "OFF");
+}
+
+void RouteTargetPublisherNode::publishServoCommand(bool down)
+{
+  if (!servo_command_pub_) {
+    return;
+  }
+  std_msgs::msg::Bool msg;
+  msg.data = down;
+  servo_command_pub_->publish(msg);
+  RCLCPP_INFO(get_logger(), "Servo command -> %s", down ? "DOWN" : "UP");
+}
+
+double RouteTargetPublisherNode::pillarDescendTargetCm(
+  std::size_t pillar_index, double clearance_cm) const
+{
+  double pillar_height_cm = 0.0;
+  if (pillar_index < pillar_summary_slots_.size()) {
+    pillar_height_cm = pillar_summary_slots_[pillar_index].pillar_height_cm;
+  }
+  if (pillar_height_cm <= 0.0) {
+    pillar_height_cm = pillar_height_threshold_cm_;
+  }
+  return pillar_height_cm + clearance_cm;
 }
 
 void RouteTargetPublisherNode::completeMission(const std::string & reason)
@@ -749,6 +950,92 @@ void RouteTargetPublisherNode::monitorTimerCallback()
       finishCurrentPillarMeasurement();
     }
     return;
+  }
+
+  // Delivery time-based phases (run independent of target-reach checks)
+  if (phase_ == MissionPhase::DELIVERY_PICK_HOLD ||
+      phase_ == MissionPhase::DELIVERY_DROP_HOLD ||
+      phase_ == MissionPhase::DELIVERY_DESCEND_PICK ||
+      phase_ == MissionPhase::DELIVERY_DESCEND_DROP) {
+    // Visual servo: forward circle_center to fine_data already happens in callback;
+    // here we monitor time-based transitions and align-then-descend logic.
+
+    if (phase_ == MissionPhase::DELIVERY_DESCEND_PICK ||
+        phase_ == MissionPhase::DELIVERY_DESCEND_DROP) {
+      double cur_x = 0.0, cur_y = 0.0, cur_z = 0.0, cur_yaw = 0.0;
+      if (!getCurrentPose(cur_x, cur_y, cur_z, cur_yaw)) {
+        return;
+      }
+
+      const bool aligned = hasFreshHoverVisualData(now()) && isHoverVisuallyAligned();
+      const bool height_ok = std::fabs(current_target_.z_cm - cur_z) <= height_tol_cm_;
+
+      if (aligned && height_ok) {
+        if (!delivery_align_started_) {
+          delivery_align_start_time_ = now();
+          delivery_align_started_ = true;
+        } else if ((now() - delivery_align_start_time_).seconds() >= delivery_align_settle_sec_) {
+          if (phase_ == MissionPhase::DELIVERY_DESCEND_PICK) {
+            phase_ = MissionPhase::DELIVERY_PICK_HOLD;
+            publishServoCommand(true);
+            publishMagnetCommand(true);
+            delivery_phase_start_time_ = now();
+            RCLCPP_INFO(get_logger(), "Delivery: PICK_HOLD start (servo down, magnet on)");
+          } else {
+            phase_ = MissionPhase::DELIVERY_DROP_HOLD;
+            publishServoCommand(true);
+            publishMagnetCommand(false);
+            delivery_phase_start_time_ = now();
+            RCLCPP_INFO(get_logger(), "Delivery: DROP_HOLD start (servo down, magnet off)");
+          }
+        }
+      } else {
+        delivery_align_started_ = false;
+      }
+
+      RCLCPP_INFO_THROTTLE(
+        get_logger(), *get_clock(), 1000,
+        "Delivery descend phase=%u target_z=%.1f cur_z=%.1f aligned=%s err=(%.1f,%.1f)",
+        static_cast<unsigned>(phase_),
+        current_target_.z_cm, cur_z, aligned ? "yes" : "no",
+        hover_visual_error_x_px_, hover_visual_error_y_px_);
+      return;
+    }
+
+    if (phase_ == MissionPhase::DELIVERY_PICK_HOLD) {
+      const double elapsed = (now() - delivery_phase_start_time_).seconds();
+      if (elapsed >= pickup_hold_sec_) {
+        publishServoCommand(false);
+        // Keep magnet ON while transporting.
+        phase_ = MissionPhase::DELIVERY_ASCEND_PICK;
+        const std::size_t pillar_idx = delivery_pickup_order_[delivery_step_];
+        const Target & pillar = pillar_targets_[pillar_idx];
+        current_target_ = Target{pillar.x_cm, pillar.y_cm, cruise_height_cm_, mission_yaw_deg_};
+        publishVisualTakeoverState(false);
+        publishOnPillar(false);
+        publishHeightFilterEnabled(false);
+        RCLCPP_INFO(get_logger(), "Delivery: PICK_HOLD done, ascending to cruise");
+        publishTarget(current_target_);
+      }
+      return;
+    }
+
+    if (phase_ == MissionPhase::DELIVERY_DROP_HOLD) {
+      const double elapsed = (now() - delivery_phase_start_time_).seconds();
+      if (elapsed >= drop_hold_sec_) {
+        publishServoCommand(false);
+        publishMagnetCommand(true);  // restore magnet for next pickup
+        phase_ = MissionPhase::DELIVERY_ASCEND_DROP;
+        const Target & empty_target = pillar_targets_[empty_pillar_index_];
+        current_target_ = Target{empty_target.x_cm, empty_target.y_cm, cruise_height_cm_, mission_yaw_deg_};
+        publishVisualTakeoverState(false);
+        publishOnPillar(false);
+        publishHeightFilterEnabled(false);
+        RCLCPP_INFO(get_logger(), "Delivery: DROP_HOLD done, ascending to cruise");
+        publishTarget(current_target_);
+      }
+      return;
+    }
   }
 
   if (phase_ == MissionPhase::LAND_ALIGN) {
@@ -826,10 +1113,90 @@ void RouteTargetPublisherNode::monitorTimerCallback()
       completeMission("Mission finished. Landing target reached and mission_complete published.");
       break;
 
+    case MissionPhase::DELIVERY_GOTO_PICK: {
+      const std::size_t pillar_idx = delivery_pickup_order_[delivery_step_];
+      const double target_z = pillarDescendTargetCm(pillar_idx, pickup_clearance_cm_);
+      const Target & pillar = pillar_targets_[pillar_idx];
+      phase_ = MissionPhase::DELIVERY_DESCEND_PICK;
+      delivery_align_started_ = false;
+      hover_has_visual_alignment_ = false;
+      hover_last_visual_sample_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
+      publishVisualTakeoverState(true);
+      publishOnPillar(true);
+      publishHeightFilterEnabled(false);
+      current_target_ = Target{pillar.x_cm, pillar.y_cm, target_z, mission_yaw_deg_};
+      RCLCPP_INFO(
+        get_logger(),
+        "Delivery: arrived above pickup pillar %zu, descending to z=%.1fcm (clearance=%.1fcm)",
+        pillar_idx + 1, target_z, pickup_clearance_cm_);
+      publishTarget(current_target_);
+      break;
+    }
+
+    case MissionPhase::DELIVERY_ASCEND_PICK: {
+      // Reached cruise after pickup. Decide retry vs proceed.
+      const bool still_has_circle = latest_circle_rank_ > 0;
+      if (still_has_circle && pickup_retry_count_ + 1 < pickup_retry_max_) {
+        ++pickup_retry_count_;
+        const std::size_t pillar_idx = delivery_pickup_order_[delivery_step_];
+        const Target & pillar = pillar_targets_[pillar_idx];
+        const double target_z = pillarDescendTargetCm(pillar_idx, pickup_clearance_cm_);
+        phase_ = MissionPhase::DELIVERY_DESCEND_PICK;
+        delivery_align_started_ = false;
+        hover_has_visual_alignment_ = false;
+        publishVisualTakeoverState(true);
+        publishOnPillar(true);
+        current_target_ = Target{pillar.x_cm, pillar.y_cm, target_z, mission_yaw_deg_};
+        RCLCPP_WARN(
+          get_logger(),
+          "Delivery: circle still visible (rank=%d), retry %d/%d",
+          latest_circle_rank_, pickup_retry_count_, pickup_retry_max_);
+        publishTarget(current_target_);
+      } else {
+        if (still_has_circle) {
+          RCLCPP_WARN(
+            get_logger(),
+            "Delivery: pickup retries exhausted, still see circle. Proceeding to drop anyway.");
+        } else {
+          RCLCPP_INFO(get_logger(), "Delivery: pickup confirmed. Proceeding to drop.");
+        }
+        beginDeliveryDrop();
+      }
+      break;
+    }
+
+    case MissionPhase::DELIVERY_GOTO_DROP: {
+      const double target_z = pillarDescendTargetCm(empty_pillar_index_, drop_clearance_cm_);
+      const Target & empty_target = pillar_targets_[empty_pillar_index_];
+      phase_ = MissionPhase::DELIVERY_DESCEND_DROP;
+      delivery_align_started_ = false;
+      hover_has_visual_alignment_ = false;
+      hover_last_visual_sample_time_ = rclcpp::Time(0, 0, get_clock()->get_clock_type());
+      publishVisualTakeoverState(true);
+      publishOnPillar(true);
+      publishHeightFilterEnabled(false);
+      current_target_ = Target{empty_target.x_cm, empty_target.y_cm, target_z, mission_yaw_deg_};
+      RCLCPP_INFO(
+        get_logger(),
+        "Delivery: arrived above drop pillar %zu, descending to z=%.1fcm (clearance=%.1fcm)",
+        empty_pillar_index_ + 1, target_z, drop_clearance_cm_);
+      publishTarget(current_target_);
+      break;
+    }
+
+    case MissionPhase::DELIVERY_ASCEND_DROP:
+      RCLCPP_INFO(get_logger(), "Delivery: drop done, advancing to next rank");
+      advanceDeliveryStep();
+      break;
+
     case MissionPhase::WAIT_PILLARS:
     case MissionPhase::HOVER_AND_MEASURE:
     case MissionPhase::LAND_ALIGN:
     case MissionPhase::COMPLETE:
+    case MissionPhase::DELIVERY_DESCEND_PICK:
+    case MissionPhase::DELIVERY_PICK_HOLD:
+    case MissionPhase::DELIVERY_DESCEND_DROP:
+    case MissionPhase::DELIVERY_DROP_HOLD:
       break;
   }
 }

@@ -183,6 +183,14 @@ class CircleDetectorNode(Node):
                 rank_msg.data = 3
             else:
                 rank_msg.data = 0
+        elif state.polygon is not None and (confirmed or allow_hold):
+            poly = state.polygon.reshape(-1, 2)
+            rect_cx = float(poly[:, 0].mean())
+            rect_cy = float(poly[:, 1].mean())
+            pt.point.x = rect_cx - frame_w / 2.0
+            pt.point.y = frame_h / 2.0 - rect_cy
+            pt.point.z = 0.0
+            rank_msg.data = 0
         else:
             return
 

@@ -61,6 +61,14 @@ enum class MissionPhase : std::uint8_t
   LAND_ALIGN = 5,
   LAND = 6,
   COMPLETE = 7,
+  DELIVERY_GOTO_PICK = 8,
+  DELIVERY_DESCEND_PICK = 9,
+  DELIVERY_PICK_HOLD = 10,
+  DELIVERY_ASCEND_PICK = 11,
+  DELIVERY_GOTO_DROP = 12,
+  DELIVERY_DESCEND_DROP = 13,
+  DELIVERY_DROP_HOLD = 14,
+  DELIVERY_ASCEND_DROP = 15,
 };
 
 class RouteTargetPublisherNode : public rclcpp::Node
@@ -97,6 +105,17 @@ private:
   void finishCurrentPillarMeasurement();
   void completeMission(const std::string & reason);
 
+  // Delivery phase helpers
+  void startDeliveryPhase();
+  void startGoToLanding();
+  bool planDeliveryOrder();
+  void beginDeliveryPickup();
+  void beginDeliveryDrop();
+  void advanceDeliveryStep();
+  void publishMagnetCommand(bool energize);
+  void publishServoCommand(bool down);
+  double pillarDescendTargetCm(std::size_t pillar_index, double clearance_cm) const;
+
   static double meterToCm(double value_m);
   static double cmToMeter(double value_cm);
   static double radToDeg(double value_rad);
@@ -110,6 +129,8 @@ private:
   rclcpp::Publisher<std_msgs::msg::Int32MultiArray>::SharedPtr fine_data_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr on_pillar_pub_;
   rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr height_filter_enabled_pub_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr magnet_command_pub_;
+  rclcpp::Publisher<std_msgs::msg::Bool>::SharedPtr servo_command_pub_;
 
   rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr ground_height_sub_;
   rclcpp::Subscription<std_msgs::msg::Float32>::SharedPtr min_range_sub_;
@@ -143,6 +164,15 @@ private:
   double landing_align_time_sec_;
   double visual_alignment_tolerance_px_;
   double visual_alignment_timeout_sec_;
+
+  // Delivery phase parameters
+  bool delivery_phase_enable_;
+  double pickup_clearance_cm_;
+  double drop_clearance_cm_;
+  double pickup_hold_sec_;
+  double drop_hold_sec_;
+  int pickup_retry_max_;
+  double delivery_align_settle_sec_;
 
   bool has_height_;
   double current_height_cm_;
@@ -178,6 +208,16 @@ private:
   bool hover_has_visual_alignment_;
 
   rclcpp::Time land_align_start_time_;
+
+  // Delivery phase state
+  std::size_t empty_pillar_index_;
+  bool empty_pillar_valid_;
+  std::vector<std::size_t> delivery_pickup_order_;  // pillar indices for rank 1, 2, 3
+  std::size_t delivery_step_;                       // 0..delivery_pickup_order_.size()
+  int pickup_retry_count_;
+  rclcpp::Time delivery_phase_start_time_;
+  rclcpp::Time delivery_align_start_time_;
+  bool delivery_align_started_;
 
   void publishOnPillar(bool active);
 };

@@ -41,6 +41,7 @@ private:
   void missionCompleteCallback(const std_msgs::msg::Empty::SharedPtr msg);
   void onPillarCallback(const std_msgs::msg::Bool::SharedPtr msg);
   void heightFilterEnabledCallback(const std_msgs::msg::Bool::SharedPtr msg);
+  void servoCommandCallback(const std_msgs::msg::Bool::SharedPtr msg);
   void pillarSignalTimerCallback();
   void protocolDataHandler(uint8_t id, const std::vector<uint8_t> & data);
   void publishFilteredHeight(int16_t raw_value_cm);
@@ -64,6 +65,7 @@ private:
   rclcpp::Subscription<std_msgs::msg::Empty>::SharedPtr mission_complete_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr on_pillar_sub_;
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr height_filter_enabled_sub_;
+  rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr servo_command_sub_;
   rclcpp::TimerBase::SharedPtr pillar_signal_timer_;
 
   std::unique_ptr<serial_comm::SerialComm> serial_comm_;
@@ -92,6 +94,7 @@ private:
   static constexpr uint8_t MISSION_COMPLETE_FRAME_ID = 0x66;
   static constexpr uint8_t MISSION_COMPLETE_VALUE = 0x06;
   static constexpr uint8_t PILLAR_SIGNAL_FRAME_ID = 0x22;
+  static constexpr uint8_t SERVO_FRAME_ID = 0x33;
 };
 
 }  // namespace uart_to_stm32

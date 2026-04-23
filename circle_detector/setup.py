@@ -22,6 +22,7 @@ setup(
     entry_points={
         'console_scripts': [
             'circle_detector_node = circle_detector_pkg.circle_detector_node:main',
+            'magnet_control_node = circle_detector_pkg.magnet_control_node:main',
         ],
     },
 )
